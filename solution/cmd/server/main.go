@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -66,17 +67,17 @@ func main() {
 		getenv("NOTIFY_MODE", notify.ModeOK),
 		getenvInt("NOTIFY_FAIL_FIRST", 2),
 	)
-	s, err := store.Open(getenv("DB_PATH", "./reminders.db"))
+	s, err := store.Open(getenv("DB_PATH", "./reminders.db"), clk)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
 	defer s.Close()
 
-	sch := sched.New(s, notifier, clk, policy)
+	sch := sched.New(s, notifier, clk, policy, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	sch.Start(getenvInt("WORKERS", 4))
 	defer sch.Stop()
 
-	srv := api.New(s, sch, notifier, clk, manual)
+	srv := api.New(s, sch, notifier, notifier, clk, manual)
 	port := getenv("PORT", "8080")
 	httpSrv := &http.Server{Addr: ":" + port, Handler: srv.Handler()}
 	go func() {

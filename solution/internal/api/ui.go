@@ -30,12 +30,15 @@ async function load(){
   document.getElementById('ts').textContent = 'updated ' + new Date().toLocaleTimeString();
   document.getElementById('clock').textContent = 'clock: ' + c.now + (c.manual ? ' (manual)' : '');
   var rows = (j.reminders||[]).map(function(m){
-    return '<tr><td><a href="/reminders/' + encodeURIComponent(m.id) + '"><code>' + m.id + '</code></a></td>' +
-    '<td>' + m.content + '</td><td>' + m.tz + '</td><td>' + m.fireAtUTC + '</td>' +
-    '<td><span class="pill ' + m.status + '">' + m.status + '</span></td>' +
+    return '<tr><td><a href="/reminders/' + encodeURIComponent(m.id) + '"><code>' + esc(m.id) + '</code></a></td>' +
+    '<td>' + esc(m.content) + '</td><td>' + esc(m.tz) + '</td><td>' + esc(m.fireAtUTC) + '</td>' +
+    '<td><span class="pill ' + esc(m.status) + '">' + esc(m.status) + '</span></td>' +
     '<td>' + m.version + '</td><td>' + m.attemptCount + '</td></tr>';
   }).join('') || '<tr><td colspan=7>no reminders yet</td></tr>';
   document.getElementById('rows').innerHTML = rows;
+}
+function esc(s){ return String(s).replace(/[&<>"']/g, function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; });
 }
 load(); setInterval(load, 1500);
 </script></body></html>`))

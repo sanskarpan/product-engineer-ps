@@ -36,11 +36,13 @@ cd solution
 go test ./... -count=1
 ```
 
-20 tests, race-clean: due-work discovery on clock advance, restart recovery,
+30 tests, race-clean: due-work discovery on clock advance, restart recovery,
 temp-failure→retry→success, exhaustion bound, permanent rejection,
-duplicate execution (exactly-once), lost-ack reconcile, edit versioning +
-stale-finish discard, cancel-wins race, terminal edit rejection, crash
-recovery, two zones + DST gap + overlap, HTTP validation, metrics/filter.
+uncertain-ack reconcile + honest exhaustion, duplicate execution (in-memory
+and durable across restart), idempotent create (dedupe vs 409), edit
+versioning + conflict + no-op + budget-carry, stale-claim/finish discard,
+cancel-wins race, terminal edit rejection, crash recovery, atomic
+attempt/state, two zones + DST gap + overlap, HTTP validation, metrics/filter.
 
 ## Acceptance scenarios and verification
 
@@ -110,12 +112,18 @@ first production change below.
    are safe by construction; receivers must still dedupe on the key.
 3. **Manual clock as a first-class citizen, not a test hack.** The server
    itself runs on the injectable clock (`CLOCK_MODE=manual` + admin time
-   travel), so the reviewer replays time exactly as tests and the benchmark
-   do — no waiting real minutes, no flaky sleeps.
+   travel — forward-only; backward jumps are rejected), so the reviewer
+   replays time exactly as tests and the benchmark do. The store takes the
+   same clock, so crash-recovery seeding can never strand retries behind
+   wall time.
 4. **Explicit DST policy with notes, not silent guesses.** Gap → +1h same
    morning; overlap → first occurrence; both return a `tzNote` shown in the
    create response. Verified empirically against Go's `time` behavior rather
    than assumed.
+5. **Uncertain outcomes stay honest.** A lost ack records `uncertain`, keeps
+   retrying under the same deduped key, and exhausts as `failed` with
+   `possibly delivered` — never a clean lie. Durable `deliveries` keys mean
+   crash + redelivery still notifies exactly once per occurrence.
 
 ## Assumptions and limitations
 

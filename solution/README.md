@@ -62,9 +62,11 @@ go test ./... -count=1
 
 Covers: due-work discovery on clock advance, restart recovery of overdue
 work, temp-failure→retry→success, exhaustion bound, permanent rejection,
-duplicate execution (exactly-once), lost-acknowledgement reconcile, edit
-versioning + stale-finish discard, cancel-wins race, terminal edit rejection,
-crash recovery, two zones + DST gap + overlap, HTTP validation, metrics/filter.
+uncertain-ack reconcile + honest exhaustion, duplicate execution
+(in-memory and durable across restart), idempotent create, edit versioning
++ conflict + no-op, stale-claim/finish discard, cancel-wins race, terminal
+edit rejection, crash recovery, atomic attempt/state, two zones + DST gap +
+overlap, HTTP validation, metrics/filter.
 
 ## Verification benchmark
 
@@ -99,16 +101,27 @@ delivered 16 / failed 2 / cancelled 2 / logicalDelivered 16.
 
 ## Retry policy (documented)
 
-- **Retryable:** temporary destination failures (down, timeout, lost ack).
+- **Retryable:** temporary destination failures (down, timeout).
+- **Uncertain:** the notification may have landed but the ack was lost.
+  Retries like temporary under the same delivery key (the destination
+  dedupes, so the retry reconciles instead of double-notifying), but the
+  attempt is recorded distinctly — and if the budget runs out on an
+  uncertain attempt, the terminal state says `possibly delivered`
+  (reconcile via the delivery key) instead of a clean `failed`.
 - **Permanent:** destination rejections (e.g. empty content) — straight to
   `failed`, 1 attempt. Retrying cannot fix them.
 - **Backoff:** `base * 2^(n-1)` + up to 20% jitter, capped at `MAX_DELAY_MS`.
 - **Guarantee:** at-least-once execution with exactly-once *logical*
-  notification per occurrence: the stable `deliveryKey` (`id:v<version>`)
-  dedupes repeat executions at the destination; uncertain outcomes
-  (lost ack) retry safely under the same key.
+  notification per occurrence. Two layers: the stable `deliveryKey`
+  (`id:v<version>`) dedupes repeat executions at the destination, and a
+  durable `deliveries` table (survives restarts, unlike process memory)
+  lets the scheduler suppress a re-send entirely and reconcile the row.
 - **Retained per attempt:** version, attempt number, started/finished stamps,
-  outcome, error, latency.
+  outcome (`success`/`retryable`/`uncertain`/`permanent`), error, latency.
+  Attempt + state transition persist atomically — no history/count skew.
+- **Budget carries across edits:** an edit bumps the version and reschedules
+  but does not reset `attempt_count`, so edits cannot mint unbounded retries.
+  History rows keep their version for audit.
 
 ## Time policy (documented)
 
@@ -123,3 +136,13 @@ delivered 16 / failed 2 / cancelled 2 / logicalDelivered 16.
 - Edit/cancel race policy: version check on finish — a result for a stale
   version (edited) or non-running row (cancelled) is discarded and counted
   in `metrics.staleDiscarded`, never overwrites the current version.
+  The claim itself re-checks version + due instant, so an interleaved edit
+  cannot cause early delivery either. Concurrent editors can pass
+  `expectedVersion` for 409-on-conflict instead of last-writer-wins;
+  no-op edits return the row untouched.
+- **Multi-worker guarantees today:** single process, N goroutines, one
+  SQLite writer. Claims are atomic CAS (`UPDATE … WHERE id+version+due`);
+  losers back off and re-poll, so one logical execution at a time per row.
+  Workers share fate (one crash takes all), and throughput caps at one
+  writer — Postgres `SKIP LOCKED` is the multi-instance path (see
+  SUBMISSION.md); the `store.Provider` seam already isolates that swap.

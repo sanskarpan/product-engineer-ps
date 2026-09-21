@@ -29,17 +29,17 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
+	clk := clock.NewManual(t0)
+	st, err := store.Open(filepath.Join(t.TempDir(), "api.db"), clk)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	clk := clock.NewManual(t0)
 	fake := notify.NewFake(notify.ModeOK, 0)
-	sch := sched.New(st, fake, clk, sched.Policy{MaxAttempts: 5, BaseDelayMs: 20, MaxDelayMs: 200})
+	sch := sched.New(st, fake, clk, sched.Policy{MaxAttempts: 5, BaseDelayMs: 20, MaxDelayMs: 200}, nil)
 	sch.Start(2)
 	t.Cleanup(sch.Stop)
-	srv := httptest.NewServer(api.New(st, sch, fake, clk, clk).Handler())
+	srv := httptest.NewServer(api.New(st, sch, fake, fake, clk, clk).Handler())
 	t.Cleanup(srv.Close)
 	return &harness{server: srv, st: st, clk: clk, fake: fake, sch: sch}
 }
@@ -158,7 +158,49 @@ func TestEditAndCancelOverHTTP(t *testing.T) {
 	}
 }
 
-// DST gap over HTTP surfaces the tzNote.
+// Idempotent create: same id + identical intent returns the existing row
+// (deduped:true); same id with different content is a 409 conflict.
+func TestIdempotentCreate(t *testing.T) {
+	h := newHarness(t)
+	body := `{"id":"dup1","content":"same","tz":"Asia/Kolkata","localTime":"2026-09-20T09:00"}`
+	code, _ := post(t, h, "/reminders", body)
+	if code != 201 {
+		t.Fatalf("first create: %d", code)
+	}
+	code, out := post(t, h, "/reminders", body)
+	if code != 200 || out["deduped"] != true {
+		t.Fatalf("identical re-create should be 200 deduped, got %d %v", code, out)
+	}
+	code, _ = post(t, h, "/reminders", `{"id":"dup1","content":"DIFFERENT","tz":"Asia/Kolkata","localTime":"2026-09-20T09:00"}`)
+	if code != 409 {
+		t.Fatalf("conflicting re-create should be 409, got %d", code)
+	}
+}
+
+// expectedVersion: stale editors get 409, not silent last-writer-wins.
+func TestEditConflictOverHTTP(t *testing.T) {
+	h := newHarness(t)
+	post(t, h, "/reminders", `{"id":"cc1","content":"a","tz":"Asia/Kolkata","localTime":"2026-09-20T09:00"}`)
+	code, out := patch(t, h, "/reminders/cc1", `{"content":"b","expectedVersion":1}`)
+	if code != 200 || out["reminder"].(map[string]any)["version"].(float64) != 2 {
+		t.Fatalf("edit v1->v2: %d %v", code, out)
+	}
+	code, _ = patch(t, h, "/reminders/cc1", `{"content":"stale","expectedVersion":1}`)
+	if code != 409 {
+		t.Fatalf("stale edit should be 409, got %d", code)
+	}
+}
+
+// Unknown status filter and negative time travel are 400s, not silent.
+func TestFilterAndClockGuards(t *testing.T) {
+	h := newHarness(t)
+	if code, _ := get(t, h, "/reminders?status=bogus"); code != 400 {
+		t.Errorf("unknown status: got %d want 400", code)
+	}
+	if code, _ := post(t, h, "/admin/clock", `{"advanceMs":-5}`); code != 400 {
+		t.Errorf("negative advance: got %d want 400", code)
+	}
+}
 func TestGapNoteOverHTTP(t *testing.T) {
 	h := newHarness(t)
 	code, out := post(t, h, "/reminders",

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/sanskarpan/product-engineer-ps/solution/internal/clock"
 	_ "modernc.org/sqlite"
 )
 
@@ -22,6 +23,7 @@ const (
 const (
 	OutcomeSuccess   = "success"
 	OutcomeRetryable = "retryable"
+	OutcomeUncertain = "uncertain" // may have landed; ack lost. Retries like retryable.
 	OutcomePermanent = "permanent"
 )
 
@@ -63,7 +65,8 @@ func DeliveryKey(id string, version int) string {
 }
 
 type Store struct {
-	db *sql.DB
+	db  *sql.DB
+	clk clock.Clock
 }
 
 // Provider is the durability seam: scheduler and API program against it,
@@ -75,15 +78,21 @@ type Provider interface {
 	ListByStatus(limit int, status string) ([]Reminder, error)
 	CountByStatus() (map[string]int64, error)
 	Attempts(id string) ([]Attempt, error)
+	// IsDelivered/MarkDelivered make the dedupe durable: unlike the
+	// destination's in-memory map, this survives process restarts, so a
+	// redelivery after a crash still notifies exactly once per key.
+	IsDelivered(key string) (bool, error)
+	MarkDelivered(key string) error
 	ClaimDue(nowMs int64) (Reminder, bool, bool, error)
 	RecordAttempt(a Attempt) error
+	FinishAttempt(a Attempt, status string, attempts int, nextRunAt *int64, lastErr string) (bool, error)
 	// FinishDelivery applies an outcome only if the row is still running at
 	// the same version. ok=false means stale (edited/cancelled meanwhile):
 	// the caller must discard the result, never overwrite the new version.
 	FinishDelivery(id string, version int, status string, attempts int, nextRunAt *int64, lastErr string) (ok bool, err error)
 	// Edit bumps the version and reschedules. Only non-terminal rows move;
 	// a concurrent running claim becomes stale via the version check above.
-	Edit(id string, content, tz, wall string, fireAtMs int64) (Reminder, error)
+	Edit(id string, content, tz, wall string, fireAtMs int64, expectedVersion int) (Reminder, error)
 	// Cancel marks cancelled where still active. Returns false when the row
 	// was already terminal (nothing to cancel).
 	Cancel(id string) (bool, error)
@@ -92,15 +101,18 @@ type Provider interface {
 
 var _ Provider = (*Store)(nil)
 
-func millis(t time.Time) int64 { return t.UnixMilli() }
+func (s *Store) nowMs() int64 { return s.clk.NowMs() }
 
-func Open(path string) (*Store, error) {
+func Open(path string, clk clock.Clock) (*Store, error) {
+	if clk == nil {
+		clk = clock.SystemClock{}
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1) // SQLite single-writer; deterministic.
-	s := &Store{db: db}
+	s := &Store{db: db, clk: clk}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -147,6 +159,10 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_rem_due ON reminders(status, next_run_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_rem_fire ON reminders(status, fire_at_ms);`,
 		`CREATE INDEX IF NOT EXISTS idx_att_rem ON attempts(reminder_id, id);`,
+		`CREATE TABLE IF NOT EXISTS deliveries(
+			delivery_key TEXT PRIMARY KEY,
+			delivered_at INTEGER NOT NULL
+		);`,
 	} {
 		if _, err := s.db.Exec(q); err != nil {
 			return fmt.Errorf("migrate: %w", err)
@@ -158,14 +174,30 @@ func (s *Store) migrate() error {
 // recoverInFlight reschedules rows left 'running' by a crashed process.
 // Overdue policy: fire ASAP in due order — a promise made must be kept,
 // late is better than never, and lateness is visible via fire_at_ms.
+// next_run_at is deliberately left untouched: a NULL value lets the already
+// overdue fire_at_ms drive immediate pickup on any clock, while a set value
+// preserves the retry's backoff. (Seeding wall-clock time here once wedged
+// manual-clock recoveries behind real time; the clock-agnostic form cannot.)
 func (s *Store) recoverInFlight() error {
-	now := millis(time.Now())
 	_, err := s.db.Exec(
 		`UPDATE reminders SET status=CASE WHEN attempt_count=0 THEN 'scheduled' ELSE 'retrying' END,
-		 next_run_at=CASE WHEN next_run_at IS NULL THEN ? ELSE next_run_at END,
 		 updated_at=? WHERE status='running'`,
-		now, now,
+		s.nowMs(),
 	)
+	return err
+}
+
+func (s *Store) IsDelivered(key string) (bool, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE delivery_key=?`, key).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func (s *Store) MarkDelivered(key string) error {
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO deliveries(delivery_key, delivered_at) VALUES(?, ?)`,
+		key, s.nowMs())
 	return err
 }
 
@@ -189,7 +221,7 @@ func scanReminder(row interface {
 }
 
 func (s *Store) Create(r Reminder) error {
-	now := millis(time.Now())
+	now := s.nowMs()
 	if r.Version < 1 {
 		r.Version = 1
 	}
@@ -279,16 +311,20 @@ func (s *Store) Attempts(id string) ([]Attempt, error) {
 	return out, rows.Err()
 }
 
-// dueTime is when a row becomes claimable: next_run_at once retrying,
-// otherwise the original fire_at.
+// ClaimDue moves one due reminder to 'running' and reports it with the
+// version and due instant observed. The claim UPDATE re-checks both, so an
+// edit that rescheduled the row (or bumped the version) between SELECT and
+// UPDATE loses the race instead of delivering the new version early.
 func (s *Store) ClaimDue(nowMs int64) (r Reminder, claimed, contended bool, err error) {
 	var id string
+	var version int
+	var due int64
 	err = s.db.QueryRow(
-		`SELECT id FROM reminders
+		`SELECT id, version, COALESCE(next_run_at, fire_at_ms) FROM reminders
 		 WHERE status IN ('scheduled','retrying')
 		   AND COALESCE(next_run_at, fire_at_ms) <= ?
 		 ORDER BY COALESCE(next_run_at, fire_at_ms) ASC LIMIT 1`, nowMs,
-	).Scan(&id)
+	).Scan(&id, &version, &due)
 	if err == sql.ErrNoRows {
 		return Reminder{}, false, false, nil
 	}
@@ -296,15 +332,17 @@ func (s *Store) ClaimDue(nowMs int64) (r Reminder, claimed, contended bool, err 
 		return Reminder{}, false, false, err
 	}
 	res, err := s.db.Exec(
-		`UPDATE reminders SET status='running', updated_at=? WHERE id=? AND status IN ('scheduled','retrying')`,
-		nowMs, id,
+		`UPDATE reminders SET status='running', updated_at=?
+		 WHERE id=? AND version=? AND status IN ('scheduled','retrying')
+		   AND COALESCE(next_run_at, fire_at_ms) <= ?`,
+		nowMs, id, version, nowMs,
 	)
 	if err != nil {
 		return Reminder{}, false, false, err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return Reminder{}, false, true, nil // lost race to another worker
+		return Reminder{}, false, true, nil // lost race: worker, edit, or cancel moved it
 	}
 	r, err = s.Get(id)
 	if err != nil {
@@ -326,6 +364,40 @@ var validFinish = map[string]bool{
 	StatusDelivered: true, StatusRetrying: true, StatusFailed: true,
 }
 
+// FinishAttempt records the attempt and applies its outcome atomically:
+// either both persist or neither does, so attempt history and
+// attempt_count can never silently diverge across a crash.
+func (s *Store) FinishAttempt(a Attempt, status string, attempts int, nextRunAt *int64, lastErr string) (applied bool, err error) {
+	if !validFinish[status] {
+		return false, fmt.Errorf("invalid transition running->%s", status)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`INSERT INTO attempts(reminder_id,version,attempt_no,started_at,finished_at,outcome,error,latency_ms)
+		 VALUES(?,?,?,?,?,?,?,?)`,
+		a.ReminderID, a.Version, a.AttemptNo, a.StartedAt, a.FinishedAt, a.Outcome, a.Error, a.LatencyMs,
+	); err != nil {
+		return false, err
+	}
+	res, err := tx.Exec(
+		`UPDATE reminders SET status=?, attempt_count=?, next_run_at=?, last_error=?, updated_at=?
+		 WHERE id=? AND version=? AND status='running'`,
+		status, attempts, nextRunAt, lastErr, s.nowMs(), a.ReminderID, a.Version,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return n == 1, nil // false = stale: edited or cancelled meanwhile, discard
+}
+
 func (s *Store) FinishDelivery(id string, version int, status string, attempts int, nextRunAt *int64, lastErr string) (bool, error) {
 	if !validFinish[status] {
 		return false, fmt.Errorf("invalid transition running->%s", status)
@@ -333,7 +405,7 @@ func (s *Store) FinishDelivery(id string, version int, status string, attempts i
 	res, err := s.db.Exec(
 		`UPDATE reminders SET status=?, attempt_count=?, next_run_at=?, last_error=?, updated_at=?
 		 WHERE id=? AND version=? AND status='running'`,
-		status, attempts, nextRunAt, lastErr, millis(time.Now()), id, version,
+		status, attempts, nextRunAt, lastErr, s.nowMs(), id, version,
 	)
 	if err != nil {
 		return false, err
@@ -342,24 +414,41 @@ func (s *Store) FinishDelivery(id string, version int, status string, attempts i
 	return n == 1, nil // false = stale: edited or cancelled meanwhile, discard
 }
 
-func (s *Store) Edit(id string, content, tz, wall string, fireAtMs int64) (Reminder, error) {
-	now := millis(time.Now())
+// Edit bumps the version and reschedules. Only non-terminal rows move; a
+// concurrent running claim becomes stale via the version check. The retry
+// budget (attempt_count) carries across versions so edits cannot mint
+// unbounded retries; history rows keep their version for audit. A no-op
+// edit (nothing actually changed) returns the row untouched. Pass
+// expectedVersion >= 0 to guard concurrent editors: a mismatch reports a
+// version conflict instead of silently winning last-writer-wins.
+func (s *Store) Edit(id string, content, tz, wall string, fireAtMs int64, expectedVersion int) (Reminder, error) {
+	cur, err := s.Get(id)
+	if err != nil {
+		return Reminder{}, err
+	}
+	switch cur.Status {
+	case StatusScheduled, StatusRetrying, StatusRunning:
+	default:
+		return Reminder{}, fmt.Errorf("not editable in status %s", cur.Status)
+	}
+	if expectedVersion >= 0 && cur.Version != expectedVersion {
+		return Reminder{}, fmt.Errorf("version conflict: expected v%d, have v%d", expectedVersion, cur.Version)
+	}
+	if cur.Content == content && cur.TZ == tz && cur.LocalWall == wall && cur.FireAtMs == fireAtMs {
+		return cur, nil // no-op: no new version, no reschedule
+	}
 	res, err := s.db.Exec(
 		`UPDATE reminders SET content=?, tz=?, local_wall=?, fire_at_ms=?,
-		 version=version+1, status='scheduled', attempt_count=0, next_run_at=NULL, last_error='',
+		 version=version+1, status='scheduled', next_run_at=NULL, last_error='',
 		 delivery_key=id || ':v' || (version+1), updated_at=?
-		 WHERE id=? AND status IN ('scheduled','retrying','running')`,
-		content, tz, wall, fireAtMs, now, id,
+		 WHERE id=? AND version=? AND status IN ('scheduled','retrying','running')`,
+		content, tz, wall, fireAtMs, s.nowMs(), id, cur.Version,
 	)
 	if err != nil {
 		return Reminder{}, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		cur, gerr := s.Get(id)
-		if gerr != nil {
-			return Reminder{}, gerr
-		}
-		return Reminder{}, fmt.Errorf("not editable in status %s", cur.Status)
+		return Reminder{}, fmt.Errorf("concurrent modification of %s (retry the edit)", id)
 	}
 	return s.Get(id)
 }
@@ -368,7 +457,7 @@ func (s *Store) Cancel(id string) (bool, error) {
 	res, err := s.db.Exec(
 		`UPDATE reminders SET status='cancelled', next_run_at=NULL, updated_at=?
 		 WHERE id=? AND status IN ('scheduled','retrying','running')`,
-		millis(time.Now()), id,
+		s.nowMs(), id,
 	)
 	if err != nil {
 		return false, err

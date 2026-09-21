@@ -1,9 +1,11 @@
 package api
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -15,19 +17,26 @@ import (
 	"github.com/sanskarpan/product-engineer-ps/solution/internal/tz"
 )
 
+// logicalCounter exposes the destination's dedupe count for /metrics.
+// The fake destination satisfies it; a real provider would bring its own
+// counter (or move the count into the scheduler snapshot).
+type logicalCounter interface{ LogicalCount() int }
+
 // Server owns HTTP ingestion + inspection. Scheduling lives in
-// sched.Scheduler, durability in store.Provider, time in clock.Clock.
+// sched.Scheduler, durability in store.Provider, time in clock.Clock,
+// delivery in notify.Notifier — all seams, no concrete dependencies.
 type Server struct {
-	store     store.Provider
-	scheduler *sched.Scheduler
-	notifier  *notify.Fake
-	clock     clock.Clock
-	manual    *clock.ManualClock // non-nil when CLOCK_MODE=manual (admin time travel)
-	mux       *http.ServeMux
+	store      store.Provider
+	scheduler  *sched.Scheduler
+	notifier   notify.Notifier
+	deliveries logicalCounter
+	clock      clock.Clock
+	manual     *clock.ManualClock // non-nil when CLOCK_MODE=manual (admin time travel)
+	mux        *http.ServeMux
 }
 
-func New(s store.Provider, sch *sched.Scheduler, n *notify.Fake, c clock.Clock, m *clock.ManualClock) *Server {
-	srv := &Server{store: s, scheduler: sch, notifier: n, clock: c, manual: m, mux: http.NewServeMux()}
+func New(s store.Provider, sch *sched.Scheduler, n notify.Notifier, c logicalCounter, clk clock.Clock, m *clock.ManualClock) *Server {
+	srv := &Server{store: s, scheduler: sch, notifier: n, deliveries: c, clock: clk, manual: m, mux: http.NewServeMux()}
 	srv.routes()
 	return srv
 }
@@ -63,7 +72,33 @@ type createRequest struct {
 }
 
 func newID() string {
-	return "rem_" + time.Now().UTC().Format("20060102T150405.000000000")
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return "rem_" + time.Now().UTC().Format("20060102T150405.000000") +
+		fmt.Sprintf("-%08x", b)
+}
+
+// resolveFire turns either input form into (fireMs, wall, tzNote).
+// Shared by create and edit so both forms behave identically.
+func resolveFire(fireAt, localTime, tzName string) (fireMs int64, wall, note string, err error) {
+	switch {
+	case strings.TrimSpace(fireAt) != "":
+		t, err := time.Parse(time.RFC3339, strings.TrimSpace(fireAt))
+		if err != nil {
+			return 0, "", "", fmt.Errorf("fireAt must be RFC3339")
+		}
+		loc, _ := time.LoadLocation(tzName) // validated by caller
+		return t.UnixMilli(), t.In(loc).Format(tz.WallLayout), "", nil
+	case strings.TrimSpace(localTime) != "":
+		wall = strings.TrimSpace(localTime)
+		t, n, err := tz.Resolve(wall, tzName)
+		if err != nil {
+			return 0, "", "", err
+		}
+		return t.UnixMilli(), wall, n, nil
+	default:
+		return 0, "", "", fmt.Errorf("one of fireAt or localTime is required")
+	}
 }
 
 // POST /reminders — create scheduled work. Accepts either a zoned instant
@@ -87,38 +122,40 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "unknown time zone " + req.TZ})
 		return
 	}
-	var fire time.Time
-	var wall, note string
-	switch {
-	case strings.TrimSpace(req.FireAt) != "":
-		t, err := time.Parse(time.RFC3339, strings.TrimSpace(req.FireAt))
-		if err != nil {
-			writeJSON(w, 400, map[string]string{"error": "fireAt must be RFC3339"})
-			return
-		}
-		fire = t
-		loc, _ := time.LoadLocation(req.TZ)
-		wall = t.In(loc).Format(tz.WallLayout)
-	case strings.TrimSpace(req.LocalTime) != "":
-		wall = strings.TrimSpace(req.LocalTime)
-		t, n, err := tz.Resolve(wall, req.TZ)
-		if err != nil {
-			writeJSON(w, 400, map[string]string{"error": err.Error()})
-			return
-		}
-		fire = t
-		note = n
-	default:
-		writeJSON(w, 400, map[string]string{"error": "one of fireAt or localTime is required"})
+	fireMs, wall, note, err := resolveFire(req.FireAt, req.LocalTime, req.TZ)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
 	id := strings.TrimSpace(req.ID)
 	if id == "" {
 		id = newID()
 	}
-	rec := store.Reminder{ID: id, Content: req.Content, TZ: req.TZ, LocalWall: wall, FireAtMs: fire.UnixMilli()}
-	if err := s.store.Create(rec); err != nil {
-		writeJSON(w, 409, map[string]string{"error": "create: " + err.Error()})
+	rec := store.Reminder{ID: id, Content: req.Content, TZ: req.TZ, LocalWall: wall, FireAtMs: fireMs}
+	if cerr := s.store.Create(rec); cerr != nil {
+		// Idempotent create: the same id with byte-identical scheduling
+		// intent returns the existing row (client crashed after persisting
+		// but before seeing the response). A conflicting id is a 409;
+		// anything else is a 500, never misreported as conflict.
+		if !isUniqueViolation(cerr) {
+			writeJSON(w, 500, map[string]string{"error": "create: " + cerr.Error()})
+			return
+		}
+		existing, gerr := s.store.Get(id)
+		if gerr != nil {
+			writeJSON(w, 500, map[string]string{"error": gerr.Error()})
+			return
+		}
+		if existing.Content == rec.Content && existing.TZ == rec.TZ &&
+			existing.LocalWall == rec.LocalWall && existing.FireAtMs == rec.FireAtMs {
+			attempts, _ := s.store.Attempts(id)
+			if attempts == nil {
+				attempts = []store.Attempt{}
+			}
+			writeJSON(w, 200, map[string]any{"reminder": existing, "attempts": attempts, "deduped": true})
+			return
+		}
+		writeJSON(w, 409, map[string]string{"error": "id " + id + " already exists with different content or schedule"})
 		return
 	}
 	s.scheduler.Kick()
@@ -135,11 +172,21 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+	want := r.URL.Query().Get("status")
+	if want != "" {
+		switch want {
+		case store.StatusScheduled, store.StatusRunning, store.StatusRetrying,
+			store.StatusDelivered, store.StatusCancelled, store.StatusFailed:
+		default:
+			writeJSON(w, 400, map[string]string{"error": "unknown status " + want})
+			return
+		}
+	}
 	var (
 		items []store.Reminder
 		err   error
 	)
-	if want := r.URL.Query().Get("status"); want != "" {
+	if want != "" {
 		items, err = s.store.ListByStatus(100, want)
 	} else {
 		items, err = s.store.List(100)
@@ -176,11 +223,16 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"reminder": got, "attempts": attempts})
 }
 
+func isUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
 type editRequest struct {
-	Content   string `json:"content"`
-	TZ        string `json:"tz"`
-	LocalTime string `json:"localTime"`
-	FireAt    string `json:"fireAt"`
+	Content         string `json:"content"`
+	TZ              string `json:"tz"`
+	LocalTime       string `json:"localTime"`
+	FireAt          string `json:"fireAt"`
+	ExpectedVersion *int   `json:"expectedVersion"`
 }
 
 // PATCH /reminders/{id} — edit time/content before delivery. Bumps the
@@ -219,28 +271,29 @@ func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
 	fireMs := cur.FireAtMs
 	wall := cur.LocalWall
 	var note string
-	if strings.TrimSpace(req.FireAt) != "" {
-		t, err := time.Parse(time.RFC3339, strings.TrimSpace(req.FireAt))
-		if err != nil {
-			writeJSON(w, 400, map[string]string{"error": "fireAt must be RFC3339"})
+	if strings.TrimSpace(req.FireAt) != "" || strings.TrimSpace(req.LocalTime) != "" {
+		var rerr error
+		fireMs, wall, note, rerr = resolveFire(req.FireAt, req.LocalTime, tzName)
+		if rerr != nil {
+			writeJSON(w, 400, map[string]string{"error": rerr.Error()})
 			return
 		}
-		fireMs = t.UnixMilli()
+	} else if strings.TrimSpace(req.TZ) != "" {
+		// Zone-only edit: re-render the same instant in the new zone.
 		loc, _ := time.LoadLocation(tzName)
-		wall = t.In(loc).Format(tz.WallLayout)
-	} else if strings.TrimSpace(req.LocalTime) != "" {
-		wall = strings.TrimSpace(req.LocalTime)
-		t, n, err := tz.Resolve(wall, tzName)
-		if err != nil {
-			writeJSON(w, 400, map[string]string{"error": err.Error()})
-			return
-		}
-		fireMs = t.UnixMilli()
-		note = n
+		wall = time.UnixMilli(cur.FireAtMs).In(loc).Format(tz.WallLayout)
 	}
-	updated, err := s.store.Edit(id, content, tzName, wall, fireMs)
+	expected := -1
+	if req.ExpectedVersion != nil {
+		expected = *req.ExpectedVersion
+	}
+	updated, err := s.store.Edit(id, content, tzName, wall, fireMs, expected)
 	if err != nil {
-		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		code := 400
+		if strings.Contains(err.Error(), "version conflict") || strings.Contains(err.Error(), "concurrent modification") {
+			code = 409
+		}
+		writeJSON(w, code, map[string]string{"error": err.Error()})
 		return
 	}
 	s.scheduler.Kick()
@@ -287,7 +340,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"scheduler": s.scheduler.Snapshot(),
-		"logicalDelivered": s.notifier.LogicalCount(), "queue": queue})
+		"logicalDelivered": s.deliveries.LogicalCount(), "queue": queue})
 }
 
 func (s *Server) handleClockGet(w http.ResponseWriter, _ *http.Request) {
@@ -307,7 +360,9 @@ func (s *Server) handleClockSet(w http.ResponseWriter, r *http.Request) {
 		Now       string `json:"now"`
 		AdvanceMs *int64 `json:"advanceMs"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
@@ -320,6 +375,10 @@ func (s *Server) handleClockSet(w http.ResponseWriter, r *http.Request) {
 		}
 		s.manual.Set(t)
 	case req.AdvanceMs != nil:
+		if *req.AdvanceMs < 0 {
+			writeJSON(w, 400, map[string]string{"error": "advanceMs must be >= 0 (time travel is forward-only)"})
+			return
+		}
 		s.manual.Advance(time.Duration(*req.AdvanceMs) * time.Millisecond)
 	default:
 		writeJSON(w, 400, map[string]string{"error": "one of now or advanceMs is required"})
@@ -334,14 +393,21 @@ func (s *Server) handleNotifyMode(w http.ResponseWriter, r *http.Request) {
 		Mode      string `json:"mode"`
 		FailFirst int    `json:"failFirst"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
 	switch req.Mode {
 	case notify.ModeOK, notify.ModeFailFirst, notify.ModeAlwaysTemp,
 		notify.ModeAlwaysPerm, notify.ModeLostAckFirst:
-		s.notifier.SetMode(req.Mode, req.FailFirst)
+		setter, ok := s.notifier.(interface{ SetMode(string, int) })
+		if !ok {
+			writeJSON(w, 400, map[string]string{"error": "destination mode is not controllable"})
+			return
+		}
+		setter.SetMode(req.Mode, req.FailFirst)
 		writeJSON(w, 200, map[string]any{"mode": req.Mode})
 	default:
 		writeJSON(w, 400, map[string]string{"error": "unknown mode"})

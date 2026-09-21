@@ -12,6 +12,12 @@ const (
 	Temporary = "temporary"
 	// Permanent failures (bad content the destination rejects) never retry.
 	Permanent = "permanent"
+	// Uncertain means the notification may have landed but the
+	// acknowledgement was lost. It retries like temporary, but the attempt
+	// is recorded distinctly and exhaustion reports possible delivery
+	// instead of a clean failure — the one case where at-least-once and
+	// exactly-once genuinely conflict must stay visible, not lie.
+	Uncertain = "uncertain"
 )
 
 // Notifier is the delivery-boundary seam: the scheduler programs against
@@ -82,11 +88,12 @@ func (f *Fake) Send(_ context.Context, key, content string) (bool, string, strin
 		if f.failLeft > 0 {
 			f.failLeft--
 			// The critical uncertain-acknowledgement case: the notification
-			// logically landed, but the caller hears "temporary failure" and
-			// will retry. The retry must not double-notify.
+			// logically landed, but the caller hears failure and will retry.
+			// The retry must not double-notify (same key), and the attempt
+			// must be recorded as uncertain, not plain retryable.
 			f.delivered[key] = true
 			f.logical++
-			return false, Temporary, "acknowledgement lost in transit"
+			return false, Uncertain, "acknowledgement lost in transit (possibly delivered)"
 		}
 	}
 	if content == "" {

@@ -63,7 +63,7 @@ func main() {
 	fake := notify.NewFake(notify.ModeFailFirst, 2) // first 2 sends fail temp
 	policy := sched.Policy{MaxAttempts: 5, BaseDelayMs: 20, MaxDelayMs: 200}
 
-	st, err := store.Open(dbPath)
+	st, err := store.Open(dbPath, clk)
 	if err != nil {
 		panic(err)
 	}
@@ -102,7 +102,7 @@ func main() {
 	for i := 1; i <= 2; i++ {
 		id := fmt.Sprintf("b-edit%d", i)
 		if _, err := st.Edit(id, "new content", "Asia/Kolkata", "2026-09-22T09:00",
-			tz.MustResolve("2026-09-22T09:00", "Asia/Kolkata").UnixMilli()); err != nil {
+			tz.MustResolve("2026-09-22T09:00", "Asia/Kolkata").UnixMilli(), -1); err != nil {
 			panic(err)
 		}
 		if ok, err := st.Cancel(fmt.Sprintf("b-cancel%d", i)); err != nil || !ok {
@@ -110,7 +110,7 @@ func main() {
 		}
 	}
 
-	sch := sched.New(st, fake, clk, policy)
+	sch := sched.New(st, fake, clk, policy, nil)
 	sch.Start(2)
 
 	// Process partway, then restart before all due work completes.
@@ -123,12 +123,12 @@ func main() {
 	if err := st.Close(); err != nil {
 		panic(err)
 	}
-	st, err = store.Open(dbPath) // restart: overdue work must be discovered
+	st, err = store.Open(dbPath, clk) // restart: overdue work must be discovered
 	if err != nil {
 		panic(err)
 	}
 	defer st.Close()
-	sch = sched.New(st, fake, clk, policy)
+	sch = sched.New(st, fake, clk, policy, nil)
 	sch.Start(2)
 	defer sch.Stop()
 

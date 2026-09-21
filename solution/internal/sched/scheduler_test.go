@@ -2,6 +2,7 @@ package sched_test
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,14 +23,14 @@ type harness struct {
 
 func newHarness(t *testing.T, mode string, failFirst int, maxAttempts int) *harness {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "sched.db"))
+	clk := clock.NewManual(t0)
+	st, err := store.Open(filepath.Join(t.TempDir(), "sched.db"), clk)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	clk := clock.NewManual(t0)
 	fake := notify.NewFake(mode, failFirst)
-	sch := sched.New(st, fake, clk, sched.Policy{MaxAttempts: maxAttempts, BaseDelayMs: 20, MaxDelayMs: 200})
+	sch := sched.New(st, fake, clk, sched.Policy{MaxAttempts: maxAttempts, BaseDelayMs: 20, MaxDelayMs: 200}, nil)
 	sch.Start(2)
 	t.Cleanup(sch.Stop)
 	return &harness{st: st, clk: clk, fake: fake, sch: sch}
@@ -174,11 +175,11 @@ func TestDuplicateExecutionSingleLogical(t *testing.T) {
 // AC2: overdue work while stopped is discovered on restart (policy: ASAP).
 func TestRestartRecoveryOverdue(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "restart.db")
-	st, err := store.Open(path)
+	clk := clock.NewManual(t0)
+	st, err := store.Open(path, clk)
 	if err != nil {
 		t.Fatal(err)
 	}
-	clk := clock.NewManual(t0)
 	if err := st.Create(store.Reminder{ID: "rem_od", Content: "overdue",
 		TZ: "America/New_York", LocalWall: "2026-09-20T09:00", FireAtMs: t0.Add(time.Hour).UnixMilli()}); err != nil {
 		t.Fatal(err)
@@ -189,13 +190,13 @@ func TestRestartRecoveryOverdue(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Restart: reopen + start scheduler at the later clock.
-	st2, err := store.Open(path)
+	st2, err := store.Open(path, clk)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st2.Close() })
 	fake := notify.NewFake(notify.ModeOK, 0)
-	sch := sched.New(st2, fake, clk, sched.Policy{MaxAttempts: 5, BaseDelayMs: 20, MaxDelayMs: 200})
+	sch := sched.New(st2, fake, clk, sched.Policy{MaxAttempts: 5, BaseDelayMs: 20, MaxDelayMs: 200}, nil)
 	sch.Start(1)
 	t.Cleanup(sch.Stop)
 	sch.Kick()
@@ -211,6 +212,7 @@ func TestRestartRecoveryOverdue(t *testing.T) {
 }
 
 // AC7: lost acknowledgement → retry reconciles to delivered, still once.
+// The uncertain attempt is recorded distinctly from plain retryable.
 func TestLostAckReconciles(t *testing.T) {
 	h := newHarness(t, notify.ModeLostAckFirst, 1, 5)
 	create(t, h, "rem_lost", t0)
@@ -225,5 +227,82 @@ func TestLostAckReconciles(t *testing.T) {
 	waitStatus(t, h, "rem_lost", time.Second, store.StatusDelivered)
 	if h.fake.LogicalCount() != 1 {
 		t.Fatalf("lost-ack retry must keep one logical notification, got %d", h.fake.LogicalCount())
+	}
+	atts := mustAttempts(t, h, "rem_lost")
+	if len(atts) != 2 || atts[0].Outcome != store.OutcomeUncertain {
+		t.Fatalf("first attempt must be uncertain, got %+v", atts)
+	}
+}
+
+// Uncertain outcomes must never terminate as a clean failure. A lost ack on
+// the only allowed attempt exhausts honestly: failed, but reporting
+// possible delivery (the notification DID land) instead of a lying "failed".
+// Note: with budget to spare, a lost-ack retry always reconciles via the
+// same delivery key — so this terminal-uncertain case needs maxAttempts=1.
+func TestUncertainExhaustionIsHonest(t *testing.T) {
+	h := newHarness(t, notify.ModeLostAckFirst, 5, 1)
+	create(t, h, "rem_unc", t0)
+	h.clk.Advance(time.Hour)
+	h.sch.Kick()
+	got := waitStatus(t, h, "rem_unc", 5*time.Second, store.StatusFailed)
+	if !strings.Contains(got.LastError, "possibly delivered") {
+		t.Fatalf("exhausted uncertain run must say possibly delivered: %q", got.LastError)
+	}
+	if h.fake.LogicalCount() != 1 {
+		t.Fatalf("exactly one logical notification, got %d", h.fake.LogicalCount())
+	}
+	atts := mustAttempts(t, h, "rem_unc")
+	if len(atts) != 1 || atts[0].Outcome != store.OutcomeUncertain {
+		t.Fatalf("attempt must be uncertain, got %+v", atts)
+	}
+}
+
+// Durable suppression: a key already delivered (even by a previous process
+// generation that crashed before finishing) is reconciled without
+// re-sending — zero new destination calls, and the keys table proves it
+// across a real close/reopen.
+func TestDurableSuppressionAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "supp.db")
+	clk := clock.NewManual(t0)
+	st, err := store.Open(path, clk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Create(store.Reminder{ID: "rem_supp", Content: "hi",
+		TZ: "Asia/Kolkata", LocalWall: "2026-09-20T09:00", FireAtMs: t0.UnixMilli()}); err != nil {
+		t.Fatal(err)
+	}
+	// Previous generation notified under this key, then crashed before the
+	// row left 'running'. Only the durable keys table remembers.
+	if err := st.MarkDelivered("rem_supp:v1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := st.ClaimDue(t0.Add(time.Hour).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// New generation, fresh destination memory: reopen, recover, schedule.
+	st2, err := store.Open(path, clk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	fake2 := notify.NewFake(notify.ModeOK, 0)
+	sch2 := sched.New(st2, fake2, clk, sched.Policy{MaxAttempts: 5, BaseDelayMs: 20, MaxDelayMs: 200}, nil)
+	sch2.Start(1)
+	defer sch2.Stop()
+	clk.Advance(2 * time.Hour)
+	sch2.Kick()
+	h2 := &harness{st: st2, clk: clk, fake: fake2, sch: sch2}
+	waitStatus(t, h2, "rem_supp", 5*time.Second, store.StatusDelivered)
+	if n := fake2.DeliveriesFor("rem_supp:v1"); n != 0 {
+		t.Fatalf("restart redelivery re-sent %d times, want 0 (durable suppression)", n)
+	}
+	atts, _ := st2.Attempts("rem_supp")
+	last := atts[len(atts)-1]
+	if last.Error != "duplicate suppressed (already delivered)" {
+		t.Fatalf("suppression must be recorded in history: %+v", last)
 	}
 }
