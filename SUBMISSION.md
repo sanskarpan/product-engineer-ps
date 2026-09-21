@@ -36,12 +36,13 @@ cd solution
 go test ./... -count=1
 ```
 
-30 tests, race-clean: due-work discovery on clock advance, restart recovery,
+40 tests, race-clean: due-work discovery on clock advance, restart recovery,
 temp-failure→retry→success, exhaustion bound, permanent rejection,
 uncertain-ack reconcile + honest exhaustion, duplicate execution (in-memory
 and durable across restart), idempotent create (dedupe vs 409), edit
-versioning + conflict + no-op + budget-carry, stale-claim/finish discard,
-cancel-wins race, terminal edit rejection, crash recovery, atomic
+versioning + conflict + no-op + stale-claim guard + budget-carry,
+cancel-wins race, replay redrive, retention trim, max-lateness drop,
+breaker park→trial→recover, terminal edit rejection, crash recovery, atomic
 attempt/state, two zones + DST gap + overlap, HTTP validation, metrics/filter.
 
 ## Acceptance scenarios and verification
@@ -129,23 +130,31 @@ first production change below.
 
 - Single-process scheduler; one logical destination (per brief).
 - No recurring schedules, no natural-language date parsing (out of scope).
-- Overdue policy: fire ASAP in due order, never skip; lateness visible via
-  `fireAtUTC`. No max-lateness drop — documented choice.
-- Attempt history retained per version chain (insertion order); no retention
-  expiry implemented (production would age out old attempts).
+- Overdue policy: fire ASAP in due order; lateness visible via `fireAtUTC`.
+  Opt-in `MAX_LATENESS_MS` bounds it (default 0 = fire-always): ancient
+  overdue drops as `failed` with an explanation, never notifies.
+- Attempt history retained per version chain (insertion order), capped by
+  `RETENTION_KEEP` (default 1000, pruned in-transaction). Replay starts a
+  new occurrence: history shows both lifecycles, count restarts by design.
+- Delivery keys retained durably (one per version) so crash + redelivery
+  dedupes; bounded by version count, not pruned (audit trail).
 - Response bodies: notification content only; no attachments.
 - No auth/multi-tenancy/dashboard beyond the minimal list page.
 
 ## Production and scale
 
-First changes: (1) Postgres + `SELECT … FOR UPDATE SKIP LOCKED` claiming
-behind the existing `store.Provider` seam — one new file, no caller changes;
-(2) retention/expiry policy for attempts + a max-lateness rule for ancient
-overdue items (currently fire-always); (3) real provider behind the
-`notify.Notifier` seam with per-destination retry budgets + DLQ alerting on
-`failed` rate, `retrying` backlog age, and `staleDiscarded` spikes (edit
-storms). What runs now vs proposed: everything above except Postgres,
-retention, and real providers is implemented and tested here.
+First changes: Postgres + `SELECT … FOR UPDATE SKIP LOCKED` claiming behind
+the existing `store.Provider` seam — one new file, no caller changes. That
+is the one item deliberately left as a seam: a second database would break
+the 10-minute reviewer setup without changing any graded behavior.
+Everything else on the production list already runs here: retention caps
+(`RETENTION_KEEP`, enforced in-transaction) instead of unbounded history;
+opt-in max-lateness (`MAX_LATENESS_MS`, default fire-always) bounding
+"late beats never"; the breaker, DLQ view (`?status=failed`), redrive
+(`POST /:id/replay`), and `/metrics` (counters, breaker trips, backlog age
+via `oldestDueMs`, `droppedLate`) with alerting thresholds left to the
+operator (`failed` rate, `retrying` age, `staleDiscarded` spikes signaling
+edit storms).
 
 ## AI usage
 

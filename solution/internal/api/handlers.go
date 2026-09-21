@@ -49,6 +49,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /reminders/{id}", s.handleGet)
 	s.mux.HandleFunc("PATCH /reminders/{id}", s.handleEdit)
 	s.mux.HandleFunc("POST /reminders/{id}/cancel", s.handleCancel)
+	s.mux.HandleFunc("POST /reminders/{id}/replay", s.handleReplay)
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("GET /admin/clock", s.handleClockGet)
@@ -328,9 +329,31 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"reminder": got})
 }
 
+// POST /reminders/{id}/replay — DLQ redrive: a failed row starts a new
+// occurrence (version+1, fresh budget — explicit operator action is the one
+// sanctioned exception to budget-carry). Only failed rows move.
+func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.store.Get(id); errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, 404, map[string]string{"error": "not found"})
+		return
+	} else if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	replayed, err := s.store.Replay(id)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	s.scheduler.Kick()
+	writeJSON(w, 200, map[string]any{"reminder": replayed})
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true,
-		"time": s.clock.Now().UTC().Format(time.RFC3339)})
+		"time":    s.clock.Now().UTC().Format(time.RFC3339),
+		"breaker": s.scheduler.Snapshot().BreakerState})
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
@@ -339,8 +362,19 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"scheduler": s.scheduler.Snapshot(),
-		"logicalDelivered": s.deliveries.LogicalCount(), "queue": queue})
+	snap := s.scheduler.Snapshot()
+	// Backlog age: how overdue the oldest waiting work is. Null when idle.
+	var oldestDueMs *int64
+	if due, ok, err := s.store.OldestDue(s.clock.NowMs()); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	} else if ok {
+		v := due
+		oldestDueMs = &v
+	}
+	writeJSON(w, 200, map[string]any{"scheduler": snap,
+		"logicalDelivered": s.deliveries.LogicalCount(), "queue": queue,
+		"oldestDueMs": oldestDueMs})
 }
 
 func (s *Server) handleClockGet(w http.ResponseWriter, _ *http.Request) {
@@ -371,6 +405,12 @@ func (s *Server) handleClockSet(w http.ResponseWriter, r *http.Request) {
 		t, err := time.Parse(time.RFC3339, req.Now)
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": "now must be RFC3339"})
+			return
+		}
+		// Forward-only like advanceMs: silently rewinding the clock would
+		// park retries and void backoff guarantees.
+		if t.UnixMilli() < s.clock.NowMs() {
+			writeJSON(w, 400, map[string]string{"error": "manual clock is forward-only"})
 			return
 		}
 		s.manual.Set(t)

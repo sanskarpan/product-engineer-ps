@@ -60,7 +60,11 @@ func main() {
 
 	start := time.Date(2026, 3, 7, 0, 0, 0, 0, time.UTC)
 	clk := clock.NewManual(start)
-	fake := notify.NewFake(notify.ModeFailFirst, 2) // first 2 sends fail temp
+	fake, err := notify.NewFakePersisted(filepath.Join(dir, "deliveries.log"), notify.ModeFailFirst, 2) // first 2 sends fail temp
+	if err != nil {
+		panic(err)
+	}
+	defer fake.Close()
 	policy := sched.Policy{MaxAttempts: 5, BaseDelayMs: 20, MaxDelayMs: 200}
 
 	st, err := store.Open(dbPath, clk)

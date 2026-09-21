@@ -200,6 +200,9 @@ func TestFilterAndClockGuards(t *testing.T) {
 	if code, _ := post(t, h, "/admin/clock", `{"advanceMs":-5}`); code != 400 {
 		t.Errorf("negative advance: got %d want 400", code)
 	}
+	if code, _ := post(t, h, "/admin/clock", `{"now":"2020-01-01T00:00:00Z"}`); code != 400 {
+		t.Errorf("backward now: got %d want 400", code)
+	}
 }
 func TestGapNoteOverHTTP(t *testing.T) {
 	h := newHarness(t)
@@ -241,7 +244,32 @@ func TestValidation(t *testing.T) {
 	}
 }
 
-// Metrics + status filter support the benchmark report.
+// Replay redrives failed rows; unknown ids 404, non-failed 400.
+func TestReplayEndpoint(t *testing.T) {
+	h := newHarness(t)
+	h.fake.SetMode(notify.ModeAlwaysPerm, 0)
+	post(t, h, "/reminders", `{"id":"rp1","content":"x","tz":"Asia/Kolkata","localTime":"2026-09-20T09:00"}`)
+	advance(t, h, 12*time.Hour)
+	waitStatus(t, h, "rp1", 5*time.Second, "failed")
+	code, out := post(t, h, "/reminders/rp1/replay", `{}`)
+	if code != 200 {
+		t.Fatalf("replay: %d %v", code, out)
+	}
+	if v := out["reminder"].(map[string]any)["version"].(float64); v != 2 {
+		t.Fatalf("replay must start a new version, got %v", out)
+	}
+	h.fake.SetMode(notify.ModeOK, 0)
+	advance(t, h, time.Hour)
+	waitStatus(t, h, "rp1", 5*time.Second, "delivered")
+	if code, _ := post(t, h, "/reminders/nope/replay", `{}`); code != 404 {
+		t.Errorf("replay unknown: got %d want 404", code)
+	}
+	if code, _ := post(t, h, "/reminders/rp1/replay", `{}`); code != 400 {
+		t.Errorf("replay delivered: got %d want 400", code)
+	}
+}
+
+// Metrics carry scheduler counters, dedupe count, queue depth, backlog age.
 func TestMetricsAndFilter(t *testing.T) {
 	h := newHarness(t)
 	post(t, h, "/reminders", `{"id":"m1","content":"a","tz":"Asia/Kolkata","localTime":"2026-09-20T09:00"}`)

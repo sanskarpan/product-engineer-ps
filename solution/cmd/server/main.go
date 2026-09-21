@@ -63,17 +63,33 @@ func main() {
 		manual = clock.NewManual(t)
 		clk = manual
 	}
-	notifier := notify.NewFake(
+	breakerCfg := sched.BreakerConfig{
+		Threshold: getenvInt("BREAKER_THRESHOLD", 10),
+		Cooldown:  time.Duration(getenvInt("BREAKER_COOLDOWN_MS", 5000)) * time.Millisecond,
+	}
+	if breakerCfg.Threshold > 0 && breakerCfg.Threshold <= policy.MaxAttempts {
+		log.Fatalf("BREAKER_THRESHOLD (%d) must exceed MAX_ATTEMPTS (%d) so one poison reminder cannot trip the circuit (0 disables)",
+			breakerCfg.Threshold, policy.MaxAttempts)
+	}
+	maxLateness := time.Duration(getenvInt("MAX_LATENESS_MS", 0)) * time.Millisecond
+	notifier, err := notify.NewFakePersisted(
+		getenv("DELIVERY_LOG", "./deliveries.log"),
 		getenv("NOTIFY_MODE", notify.ModeOK),
 		getenvInt("NOTIFY_FAIL_FIRST", 2),
 	)
+	if err != nil {
+		log.Fatalf("delivery log: %v", err)
+	}
+	defer notifier.Close()
 	s, err := store.Open(getenv("DB_PATH", "./reminders.db"), clk)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
 	defer s.Close()
+	s.SetRetention(getenvInt("RETENTION_KEEP", 1000))
 
-	sch := sched.New(s, notifier, clk, policy, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	sch := sched.NewFull(s, notifier, clk, policy, breakerCfg, maxLateness,
+		slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	sch.Start(getenvInt("WORKERS", 4))
 	defer sch.Stop()
 
@@ -85,8 +101,9 @@ func main() {
 		if manual != nil {
 			mode = "manual@" + clk.Now().UTC().Format(time.RFC3339)
 		}
-		fmt.Printf("reminders on :%s clock=%s maxAttempts=%d baseDelayMs=%d\n",
-			port, mode, policy.MaxAttempts, policy.BaseDelayMs)
+		fmt.Printf("reminders on :%s clock=%s maxAttempts=%d baseDelayMs=%d breaker=%d/%s maxLateness=%s retention=%d\n",
+			port, mode, policy.MaxAttempts, policy.BaseDelayMs,
+			breakerCfg.Threshold, breakerCfg.Cooldown, maxLateness, getenvInt("RETENTION_KEEP", 1000))
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)
 		}

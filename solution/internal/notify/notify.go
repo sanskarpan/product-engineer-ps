@@ -1,8 +1,11 @@
 package notify
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 )
 
@@ -49,11 +52,62 @@ type Fake struct {
 	delivered map[string]bool
 	calls     map[string]int
 	logical   int
+	// persist, when non-empty, is an append-only log of delivered keys,
+	// fsynced on every delivery and reloaded on boot. It closes the
+	// crash-between-send-and-record window: without it, a restart loses
+	// the in-memory map and a redelivery would notify twice. Any real
+	// Notifier must provide the same durable-dedupe contract; this file
+	// is the fake's implementation of it.
+	persist *os.File
 }
 
 func NewFake(mode string, failFirst int) *Fake {
 	return &Fake{mode: mode, failLeft: failFirst,
 		delivered: map[string]bool{}, calls: map[string]int{}}
+}
+
+// NewFakePersisted is NewFake plus a durable delivery log at path
+// (created if missing, loaded if present). Empty path = memory only.
+func NewFakePersisted(path, mode string, failFirst int) (*Fake, error) {
+	f := NewFake(mode, failFirst)
+	if path == "" {
+		return f, nil
+	}
+	fp, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	f.persist = fp
+	if _, err := fp.Seek(0, 0); err != nil {
+		fp.Close()
+		return nil, err
+	}
+	for sc := bufio.NewScanner(fp); sc.Scan(); {
+		if key := strings.TrimSpace(sc.Text()); key != "" {
+			f.delivered[key] = true
+			f.logical++
+		}
+	}
+	return f, nil
+}
+
+func (f *Fake) Close() error {
+	if f.persist == nil {
+		return nil
+	}
+	return f.persist.Close()
+}
+
+// recordLocked persists a key BEFORE it counts logically: a crash after
+// the fsync still dedupes on reboot; a crash before it never notified.
+func (f *Fake) recordLocked(key string) {
+	if f.persist != nil {
+		if _, err := fmt.Fprintln(f.persist, key); err == nil {
+			_ = f.persist.Sync()
+		}
+	}
+	f.delivered[key] = true
+	f.logical++
 }
 
 func (f *Fake) SetMode(mode string, failFirst int) {
@@ -91,16 +145,14 @@ func (f *Fake) Send(_ context.Context, key, content string) (bool, string, strin
 			// logically landed, but the caller hears failure and will retry.
 			// The retry must not double-notify (same key), and the attempt
 			// must be recorded as uncertain, not plain retryable.
-			f.delivered[key] = true
-			f.logical++
+			f.recordLocked(key)
 			return false, Uncertain, "acknowledgement lost in transit (possibly delivered)"
 		}
 	}
 	if content == "" {
 		return false, Permanent, "empty content rejected"
 	}
-	f.delivered[key] = true
-	f.logical++
+	f.recordLocked(key)
 	return true, "", ""
 }
 

@@ -276,6 +276,75 @@ func TestCancelWinsOverInFlight(t *testing.T) {
 	}
 }
 
+// Replay redrives a failed row as a new occurrence with a fresh budget —
+// the one sanctioned exception to budget-carry, and only for failed rows.
+func TestReplayFailed(t *testing.T) {
+	s := open(t)
+	now := time.Now().UnixMilli()
+	if err := s.Create(mk("rem_rp", now)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, _, err := s.ClaimDue(now + 1000)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	if _, err := s.FinishDelivery("rem_rp", claimed.Version, store.StatusFailed, 5, nil, "exhausted"); err != nil {
+		t.Fatal(err)
+	}
+	re, err := s.Replay("rem_rp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if re.Version != 2 || re.Status != store.StatusScheduled || re.Attempts != 0 {
+		t.Fatalf("bad replay: %+v", re)
+	}
+	if _, err := s.Replay("rem_rp"); err == nil {
+		t.Fatal("replay of scheduled row must fail")
+	}
+}
+
+// Retention caps history: newest N rows per reminder survive.
+func TestPruneAttempts(t *testing.T) {
+	s := open(t)
+	now := time.Now().UnixMilli()
+	if err := s.Create(mk("rem_pr", now)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 5; i++ {
+		if err := s.RecordAttempt(store.Attempt{ReminderID: "rem_pr", Version: 1,
+			AttemptNo: i, StartedAt: now, FinishedAt: now, Outcome: store.OutcomeRetryable}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := s.PruneAttempts(2)
+	if err != nil || removed != 3 {
+		t.Fatalf("prune: %v removed=%d", err, removed)
+	}
+	atts, _ := s.Attempts("rem_pr")
+	if len(atts) != 2 || atts[0].AttemptNo != 4 || atts[1].AttemptNo != 5 {
+		t.Fatalf("kept wrong rows: %+v", atts)
+	}
+}
+
+// OldestDue reports backlog age; false when idle.
+func TestOldestDue(t *testing.T) {
+	s := open(t)
+	now := time.Now().UnixMilli()
+	if _, ok, err := s.OldestDue(now); err != nil || ok {
+		t.Fatalf("idle: ok=%v err=%v", ok, err)
+	}
+	if err := s.Create(mk("rem_od1", now-5000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Create(mk("rem_od2", now-1000)); err != nil {
+		t.Fatal(err)
+	}
+	due, ok, err := s.OldestDue(now)
+	if err != nil || !ok || due != now-5000 {
+		t.Fatalf("oldest: due=%d ok=%v err=%v", due, ok, err)
+	}
+}
+
 // Terminal rows are not editable.
 func TestEditTerminalRejected(t *testing.T) {
 	s := open(t)

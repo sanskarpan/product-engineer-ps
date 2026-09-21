@@ -211,7 +211,96 @@ func TestRestartRecoveryOverdue(t *testing.T) {
 	t.Fatal("overdue reminder was not recovered after restart")
 }
 
-// AC7: lost acknowledgement → retry reconciles to delivered, still once.
+// The breaker parks claiming while the destination is down: attempts stop
+// accumulating; once it recovers, the half-open trial succeeds and the
+// backlog drains without operator action.
+func TestBreakerParksAndRecovers(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "brk.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	clk := clock.NewManual(t0)
+	fake := notify.NewFake(notify.ModeAlwaysTemp, 0)
+	bc := sched.BreakerConfig{Threshold: 3, Cooldown: 300 * time.Millisecond}
+	sch := sched.NewFull(st, fake, clk,
+		sched.Policy{MaxAttempts: 20, BaseDelayMs: 20, MaxDelayMs: 100}, bc, 0, nil)
+	sch.Start(2)
+	t.Cleanup(sch.Stop)
+	if err := st.Create(store.Reminder{ID: "rem_brk", Content: "x",
+		TZ: "Asia/Kolkata", LocalWall: "2026-09-20T09:00", FireAtMs: t0.UnixMilli()}); err != nil {
+		t.Fatal(err)
+	}
+	sch.Kick()
+	// Wait for the circuit to open under persistent failures, driving the
+	// manual clock so backoffs come due (retries need clock movement).
+	deadline := time.Now().Add(8 * time.Second)
+	opened := false
+	for time.Now().Before(deadline) {
+		clk.Advance(500 * time.Millisecond)
+		sch.Kick()
+		if sch.Snapshot().BreakerState == sched.BreakerOpen ||
+			sch.Snapshot().BreakerState == sched.BreakerHalfOpen {
+			opened = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !opened {
+		t.Fatal("breaker should open under persistent failures")
+	}
+	// Parked: attempt count must not grow unboundedly while open.
+	n1 := len(mustAttempts(t, &harness{st: st}, "rem_brk"))
+	time.Sleep(250 * time.Millisecond)
+	n2 := len(mustAttempts(t, &harness{st: st}, "rem_brk"))
+	if n2 > n1+2 {
+		t.Fatalf("open breaker must park scheduling, attempts %d -> %d", n1, n2)
+	}
+	// Destination recovers: trial succeeds, circuit closes, delivery lands.
+	fake.SetMode(notify.ModeOK, 0)
+	clk.Advance(time.Hour)
+	sch.Kick()
+	h := &harness{st: st, clk: clk, fake: fake, sch: sch}
+	waitStatus(t, h, "rem_brk", 8*time.Second, store.StatusDelivered)
+	if got := sch.Snapshot(); got.BreakerState != sched.BreakerClosed || got.BreakerOpens < 1 {
+		t.Fatalf("breaker should be closed after recovery: %+v", got)
+	}
+}
+
+// Max-lateness drops ancient overdue work instead of delivering it:
+// a bound on "late beats never". Disabled by default (zero).
+func TestMaxLatenessDropsAncient(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "late.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	clk := clock.NewManual(t0)
+	fake := notify.NewFake(notify.ModeOK, 0)
+	sch := sched.NewFull(st, fake, clk,
+		sched.Policy{MaxAttempts: 5, BaseDelayMs: 20, MaxDelayMs: 100},
+		sched.BreakerDisabled(), time.Hour, nil)
+	sch.Start(1)
+	t.Cleanup(sch.Stop)
+	if err := st.Create(store.Reminder{ID: "rem_late", Content: "3am pill",
+		TZ: "Asia/Kolkata", LocalWall: "2026-09-20T09:00", FireAtMs: t0.UnixMilli()}); err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(3 * time.Hour) // 3h overdue with a 1h limit
+	sch.Kick()
+	h := &harness{st: st, clk: clk, fake: fake, sch: sch}
+	got := waitStatus(t, h, "rem_late", 5*time.Second, store.StatusFailed)
+	if !strings.Contains(got.LastError, "max lateness") {
+		t.Fatalf("drop must explain itself: %q", got.LastError)
+	}
+	if fake.LogicalCount() != 0 {
+		t.Fatal("dropped work must never notify")
+	}
+	if sch.Snapshot().DroppedLate != 1 {
+		t.Fatalf("snapshot: %+v", sch.Snapshot())
+	}
+}
+
 // The uncertain attempt is recorded distinctly from plain retryable.
 func TestLostAckReconciles(t *testing.T) {
 	h := newHarness(t, notify.ModeLostAckFirst, 1, 5)

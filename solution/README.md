@@ -95,6 +95,11 @@ delivered 16 / failed 2 / cancelled 2 / logicalDelivered 16.
 | CLOCK_START | 2026-09-20T00:00:00Z | manual clock start (RFC3339) |
 | NOTIFY_MODE | ok | ok / fail-first / always-temp / always-perm / lost-ack |
 | NOTIFY_FAIL_FIRST | 2 | temp failures before success in fail-first |
+| DELIVERY_LOG | ./deliveries.log | fsynced destination dedupe log (durable exactly-once) |
+| BREAKER_THRESHOLD | 10 | consecutive failing sends before the circuit opens (0 disables; must exceed MAX_ATTEMPTS) |
+| BREAKER_COOLDOWN_MS | 5000 | claiming pause before a half-open trial |
+| MAX_LATENESS_MS | 0 | drop overdue work past this lateness instead of delivering (0 = disabled, fire-always) |
+| RETENTION_KEEP | 1000 | attempt-history rows kept per reminder (pruned atomically on finish) |
 ```
 
 ---
@@ -112,16 +117,36 @@ delivered 16 / failed 2 / cancelled 2 / logicalDelivered 16.
   `failed`, 1 attempt. Retrying cannot fix them.
 - **Backoff:** `base * 2^(n-1)` + up to 20% jitter, capped at `MAX_DELAY_MS`.
 - **Guarantee:** at-least-once execution with exactly-once *logical*
-  notification per occurrence. Two layers: the stable `deliveryKey`
-  (`id:v<version>`) dedupes repeat executions at the destination, and a
-  durable `deliveries` table (survives restarts, unlike process memory)
-  lets the scheduler suppress a re-send entirely and reconcile the row.
+  notification per occurrence. Three layers: the stable `deliveryKey`
+  (`id:v<version>`) dedupes repeat executions; a durable `deliveries` table
+  lets the scheduler suppress re-sends across restarts; and the destination
+  itself keeps an fsynced delivery log (`DELIVERY_LOG`, reloaded on boot),
+  closing the crash-between-send-and-record window. Contract for any real
+  `Notifier`: durably dedupe on the key before counting — the local table
+  is the fast path, the destination log is the guarantee.
 - **Retained per attempt:** version, attempt number, started/finished stamps,
   outcome (`success`/`retryable`/`uncertain`/`permanent`), error, latency.
   Attempt + state transition persist atomically — no history/count skew.
+  History is capped per reminder (`RETENTION_KEEP`, pruned in-transaction).
 - **Budget carries across edits:** an edit bumps the version and reschedules
   but does not reset `attempt_count`, so edits cannot mint unbounded retries.
-  History rows keep their version for audit.
+  History rows keep their version for audit. `POST /reminders/{id}/replay`
+  redrives a failed row as a new occurrence with a fresh budget — explicit
+  operator action is the one sanctioned exception.
+- **Circuit breaker:** 10 (default) consecutive failing sends open the
+  circuit — workers pause claiming instead of hammering a down destination,
+  `/health` reports `open`, one half-open trial after the cooldown decides
+  close (success only) vs re-open. Decisive outcomes (success, permanent
+  rejection) prove liveness and reset the count outside trials. The cooldown
+  ticks on wall time (not the manual clock): under time travel it still
+  paces in real seconds, which is the safe direction.
+- **Max lateness (opt-in):** `MAX_LATENESS_MS=0` default preserves fire-always
+  ASAP; set it to bound "late beats never" (overdue drops fail with an
+  explanation, never notify, counted in `metrics.droppedOverdue`).
+- **Metrics:** `GET /metrics` returns scheduler counters (delivered / failed /
+  attempts / staleDiscarded / droppedOverdue), breaker state + trips, dedupe
+  count, queue depth per status, and oldest-due backlog age.
+  `GET /reminders?status=failed` is the DLQ view; replay is its redrive.
 
 ## Time policy (documented)
 

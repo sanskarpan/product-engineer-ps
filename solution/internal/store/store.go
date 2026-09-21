@@ -67,6 +67,18 @@ func DeliveryKey(id string, version int) string {
 type Store struct {
 	db  *sql.DB
 	clk clock.Clock
+	// retain caps per-reminder attempt history (0 = unbounded). Set via
+	// SetRetention; enforced atomically inside FinishAttempt.
+	retain int
+}
+
+// SetRetention caps stored attempt history per reminder. Oldest rows are
+// dropped inside the finishing transaction, so the cap holds exactly.
+func (s *Store) SetRetention(keepPerReminder int) {
+	if keepPerReminder < 0 {
+		keepPerReminder = 0
+	}
+	s.retain = keepPerReminder
 }
 
 // Provider is the durability seam: scheduler and API program against it,
@@ -83,6 +95,12 @@ type Provider interface {
 	// redelivery after a crash still notifies exactly once per key.
 	IsDelivered(key string) (bool, error)
 	MarkDelivered(key string) error
+	// PruneAttempts caps per-reminder history for retention: keeps the
+	// newest keep rows per reminder, drops the rest. Returns rows removed.
+	PruneAttempts(keepPerReminder int) (int64, error)
+	// OldestDue reports the oldest due instant among claimable rows
+	// (for backlog-age metrics). ok=false when nothing is due.
+	OldestDue(nowMs int64) (dueMs int64, ok bool, err error)
 	ClaimDue(nowMs int64) (Reminder, bool, bool, error)
 	RecordAttempt(a Attempt) error
 	FinishAttempt(a Attempt, status string, attempts int, nextRunAt *int64, lastErr string) (bool, error)
@@ -96,6 +114,10 @@ type Provider interface {
 	// Cancel marks cancelled where still active. Returns false when the row
 	// was already terminal (nothing to cancel).
 	Cancel(id string) (bool, error)
+	// Replay redrives a failed row as a new occurrence: version+1, fresh
+	// retry budget (explicit operator action — the one sanctioned exception
+	// to budget-carry), rescheduled now. Only failed rows move.
+	Replay(id string) (Reminder, error)
 	Close() error
 }
 
@@ -199,6 +221,38 @@ func (s *Store) MarkDelivered(key string) error {
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO deliveries(delivery_key, delivered_at) VALUES(?, ?)`,
 		key, s.nowMs())
 	return err
+}
+
+func (s *Store) PruneAttempts(keepPerReminder int) (int64, error) {
+	if keepPerReminder < 1 {
+		keepPerReminder = 1
+	}
+	res, err := s.db.Exec(
+		`DELETE FROM attempts WHERE id NOT IN (
+			SELECT id FROM attempts AS a2 WHERE a2.reminder_id = attempts.reminder_id
+			ORDER BY id DESC LIMIT ?)`, keepPerReminder,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+func (s *Store) OldestDue(nowMs int64) (int64, bool, error) {
+	var due sql.NullInt64
+	err := s.db.QueryRow(
+		`SELECT MIN(COALESCE(next_run_at, fire_at_ms)) FROM reminders
+		 WHERE status IN ('scheduled','retrying')
+		   AND COALESCE(next_run_at, fire_at_ms) <= ?`, nowMs,
+	).Scan(&due)
+	if err != nil {
+		return 0, false, err
+	}
+	if !due.Valid {
+		return 0, false, nil
+	}
+	return due.Int64, true, nil
 }
 
 func scanReminder(row interface {
@@ -392,6 +446,17 @@ func (s *Store) FinishAttempt(a Attempt, status string, attempts int, nextRunAt 
 		return false, err
 	}
 	n, _ := res.RowsAffected()
+	if n == 1 && s.retain > 0 {
+		// Retention inside the same transaction: history can never exceed
+		// the cap, even across a crash between insert and prune.
+		if _, err := tx.Exec(
+			`DELETE FROM attempts WHERE reminder_id=? AND id NOT IN (
+				SELECT id FROM attempts AS a2 WHERE a2.reminder_id=? ORDER BY id DESC LIMIT ?)`,
+			a.ReminderID, a.ReminderID, s.retain,
+		); err != nil {
+			return false, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
@@ -464,4 +529,24 @@ func (s *Store) Cancel(id string) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n == 1, nil
+}
+
+func (s *Store) Replay(id string) (Reminder, error) {
+	res, err := s.db.Exec(
+		`UPDATE reminders SET version=version+1, status='scheduled', attempt_count=0,
+		 next_run_at=NULL, last_error='', delivery_key=id || ':v' || (version+1), updated_at=?
+		 WHERE id=? AND status='failed'`,
+		s.nowMs(), id,
+	)
+	if err != nil {
+		return Reminder{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		cur, gerr := s.Get(id)
+		if gerr != nil {
+			return Reminder{}, gerr
+		}
+		return Reminder{}, fmt.Errorf("only failed rows can be replayed (status=%s)", cur.Status)
+	}
+	return s.Get(id)
 }

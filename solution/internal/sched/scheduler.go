@@ -54,11 +54,13 @@ func (p Policy) backoff(n int, rnd *rand.Rand) time.Duration {
 // (store.Provider), the fake destination owns idempotency (notify.Notifier),
 // the clock owns time (clock.Clock). It owns none of those.
 type Scheduler struct {
-	store    store.Provider
-	notifier notify.Notifier
-	clock    clock.Clock
-	policy   Policy
-	log      *slog.Logger
+	store       store.Provider
+	notifier    notify.Notifier
+	clock       clock.Clock
+	policy      Policy
+	breaker     *Breaker
+	maxLateness time.Duration // 0 = disabled: overdue always fires ASAP
+	log         *slog.Logger
 
 	notifyCh chan struct{}
 	stop     chan struct{}
@@ -71,32 +73,44 @@ type Scheduler struct {
 	stopped  bool
 	rnd      *rand.Rand
 
-	delivered atomic.Int64
-	failed    atomic.Int64
-	attempts  atomic.Int64
-	stale     atomic.Int64 // in-flight results discarded after edit/cancel
+	delivered   atomic.Int64
+	failed      atomic.Int64
+	attempts    atomic.Int64
+	stale       atomic.Int64 // in-flight results discarded after edit/cancel
+	droppedLate atomic.Int64 // overdue beyond max-lateness, dropped not delivered
 }
 
 type Snapshot struct {
-	Delivered int64 `json:"delivered"`
-	Failed    int64 `json:"failed"`
-	Attempts  int64 `json:"attempts"`
-	Stale     int64 `json:"staleDiscarded"`
+	Delivered    int64  `json:"delivered"`
+	Failed       int64  `json:"failed"`
+	Attempts     int64  `json:"attempts"`
+	Stale        int64  `json:"staleDiscarded"`
+	DroppedLate  int64  `json:"droppedOverdue"`
+	BreakerState string `json:"breakerState"`
+	BreakerOpens int64  `json:"breakerOpens"`
 }
 
 func New(s store.Provider, n notify.Notifier, c clock.Clock, p Policy, log *slog.Logger) *Scheduler {
+	return NewFull(s, n, c, p, BreakerDisabled(), 0, log)
+}
+
+// NewFull wires the production options: breaker + max-lateness. Tests use
+// New and opt in explicitly.
+func NewFull(s store.Provider, n notify.Notifier, c clock.Clock, p Policy, bc BreakerConfig, maxLateness time.Duration, log *slog.Logger) *Scheduler {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Scheduler{store: s, notifier: n, clock: c, policy: p, log: log,
+	return &Scheduler{store: s, notifier: n, clock: c, policy: p,
+		breaker: NewBreaker(bc), maxLateness: maxLateness, log: log,
 		notifyCh: make(chan struct{}, 1), stop: make(chan struct{}),
 		ctx: ctx, cancel: cancel, rnd: rand.New(rand.NewSource(time.Now().UnixNano()))}
 }
 
 func (d *Scheduler) Snapshot() Snapshot {
 	return Snapshot{Delivered: d.delivered.Load(), Failed: d.failed.Load(),
-		Attempts: d.attempts.Load(), Stale: d.stale.Load()}
+		Attempts: d.attempts.Load(), Stale: d.stale.Load(), DroppedLate: d.droppedLate.Load(),
+		BreakerState: d.breaker.State(), BreakerOpens: d.breaker.Opens()}
 }
 
 func (d *Scheduler) Kick() {
@@ -158,9 +172,25 @@ func (d *Scheduler) drain() {
 			return
 		default:
 		}
+		if !d.breaker.Allow() {
+			// Circuit open: pause claiming instead of hammering a down
+			// destination. The notify arm keeps recovery responsive.
+			wait := d.breaker.Remaining()
+			if wait <= 0 {
+				wait = 50 * time.Millisecond
+			}
+			select {
+			case <-d.stop:
+				return
+			case <-d.notifyCh:
+			case <-time.After(wait):
+			}
+			return
+		}
 		r, ok, contended, err := d.store.ClaimDue(d.clock.NowMs())
 		if err != nil {
 			d.log.Error("claim due failed", "err", err)
+			d.breaker.ReleaseTrial()
 			time.Sleep(200 * time.Millisecond)
 			return
 		}
@@ -172,6 +202,7 @@ func (d *Scheduler) drain() {
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}
+		d.breaker.ReleaseTrial() // admitted trial, empty queue: don't wedge half-open
 		return
 	}
 }
@@ -182,10 +213,53 @@ func (d *Scheduler) backoff(n int) time.Duration {
 	return d.policy.backoff(n, d.rnd)
 }
 
+// noteBreaker feeds the circuit breaker and logs transitions. A half-open
+// trial is judged strictly: only a successful send proves destination
+// health and closes the circuit. Outside trials, permanent rejections also
+// prove liveness (the destination answered decisively) and reset the count.
+func (d *Scheduler) noteBreaker(outcome string) {
+	before := d.breaker.State()
+	switch {
+	case before == BreakerHalfOpen && outcome == store.OutcomeSuccess:
+		d.breaker.RecordSuccess()
+	case before == BreakerHalfOpen:
+		d.breaker.RecordFailure()
+	case outcome == store.OutcomeSuccess || outcome == store.OutcomePermanent:
+		d.breaker.RecordSuccess()
+	default:
+		d.breaker.RecordFailure()
+	}
+	if after := d.breaker.State(); after != before {
+		d.log.Info("circuit breaker transition", "from", before, "to", after)
+	}
+}
+
 func (d *Scheduler) deliver(r store.Reminder) {
 	attemptNo := r.Attempts + 1
 	started := d.clock.NowMs()
 	t0 := time.Now() // wall clock: latency stays meaningful under time travel
+
+	// Max-lateness gate (opt-in production policy): an item overdue beyond
+	// the limit is dropped, not delivered — a 3am pill reminder firing at
+	// noon is wrong, and "late beats never" must have a bound. No attempt
+	// is recorded (nothing was attempted); the error explains the drop.
+	// Disabled (0) by default, preserving fire-always ASAP semantics.
+	if d.maxLateness > 0 && started-r.FireAtMs > d.maxLateness.Milliseconds() {
+		d.droppedLate.Add(1)
+		d.failed.Add(1)
+		msg := fmt.Sprintf("dropped: overdue %s exceeds max lateness %s",
+			time.Duration(started-r.FireAtMs)*time.Millisecond, d.maxLateness)
+		// No attempt row exists for a drop (nothing was attempted), so the
+		// count stays put — history length and count never skew.
+		applied, err := d.store.FinishDelivery(r.ID, r.Version, store.StatusFailed, r.Attempts, nil, msg)
+		if err != nil {
+			d.log.Error("state update failed", "id", r.ID, "err", err)
+		} else if !applied {
+			d.stale.Add(1)
+		}
+		d.log.Info("overdue dropped", "id", r.ID, "overdue_ms", started-r.FireAtMs)
+		return
+	}
 
 	// Durable dedupe: if this key already notified (e.g. a lost-ack retry or
 	// a redelivery after a crash), suppress the re-send and reconcile the
@@ -223,6 +297,7 @@ func (d *Scheduler) deliver(r store.Reminder) {
 			outcome = store.OutcomeRetryable
 		}
 	}
+	d.noteBreaker(outcome)
 	d.attempts.Add(1)
 	d.log.Info("attempt", "id", r.ID, "version", r.Version, "attempt", attemptNo,
 		"outcome", outcome, "latency_ms", latency, "err", errStr)
