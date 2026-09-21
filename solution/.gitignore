@@ -3,3 +3,5 @@
 *.db-shm
 *.log
 bin/
+# Local-only demo notes, never submit
+DEMO_SCRIPT.md
