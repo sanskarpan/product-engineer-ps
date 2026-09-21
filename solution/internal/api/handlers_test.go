@@ -251,6 +251,10 @@ func TestReplayEndpoint(t *testing.T) {
 	post(t, h, "/reminders", `{"id":"rp1","content":"x","tz":"Asia/Kolkata","localTime":"2026-09-20T09:00"}`)
 	advance(t, h, 12*time.Hour)
 	waitStatus(t, h, "rp1", 5*time.Second, "failed")
+	// Recover the destination BEFORE replay: replay redrives immediately
+	// (the original fire time is in the past), so the mode must be healthy
+	// first or the new occurrence would fail again.
+	h.fake.SetMode(notify.ModeOK, 0)
 	code, out := post(t, h, "/reminders/rp1/replay", `{}`)
 	if code != 200 {
 		t.Fatalf("replay: %d %v", code, out)
@@ -258,8 +262,6 @@ func TestReplayEndpoint(t *testing.T) {
 	if v := out["reminder"].(map[string]any)["version"].(float64); v != 2 {
 		t.Fatalf("replay must start a new version, got %v", out)
 	}
-	h.fake.SetMode(notify.ModeOK, 0)
-	advance(t, h, time.Hour)
 	waitStatus(t, h, "rp1", 5*time.Second, "delivered")
 	if code, _ := post(t, h, "/reminders/nope/replay", `{}`); code != 404 {
 		t.Errorf("replay unknown: got %d want 404", code)

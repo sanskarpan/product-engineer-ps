@@ -363,18 +363,23 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	snap := s.scheduler.Snapshot()
-	// Backlog age: how overdue the oldest waiting work is. Null when idle.
-	var oldestDueMs *int64
+	// Backlog: the oldest claimable due instant and how overdue it is
+	// (the value to alert on). Both null when nothing is due.
+	var oldestDueMs, backlogAgeMs *int64
 	if due, ok, err := s.store.OldestDue(s.clock.NowMs()); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	} else if ok {
-		v := due
-		oldestDueMs = &v
+		d := due
+		a := s.clock.NowMs() - due
+		if a < 0 {
+			a = 0
+		}
+		oldestDueMs, backlogAgeMs = &d, &a
 	}
 	writeJSON(w, 200, map[string]any{"scheduler": snap,
 		"logicalDelivered": s.deliveries.LogicalCount(), "queue": queue,
-		"oldestDueMs": oldestDueMs})
+		"oldestDueMs": oldestDueMs, "backlogAgeMs": backlogAgeMs})
 }
 
 func (s *Server) handleClockGet(w http.ResponseWriter, _ *http.Request) {

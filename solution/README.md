@@ -145,7 +145,8 @@ delivered 16 / failed 2 / cancelled 2 / logicalDelivered 16.
   explanation, never notify, counted in `metrics.droppedOverdue`).
 - **Metrics:** `GET /metrics` returns scheduler counters (delivered / failed /
   attempts / staleDiscarded / droppedOverdue), breaker state + trips, dedupe
-  count, queue depth per status, and oldest-due backlog age.
+  count, queue depth per status, and backlog (`oldestDueMs` instant +
+  `backlogAgeMs` age, both null when idle).
   `GET /reminders?status=failed` is the DLQ view; replay is its redrive.
 
 ## Time policy (documented)
