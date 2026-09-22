@@ -6,7 +6,7 @@
 - **Email:** sanskar.works.2004@gmail.com
 - **GitHub:** https://github.com/sanskarpan
 - **Selected problem:** Problem 3 — Durable Reminders and Follow-Ups
-- **Demo video:** TODO — record 3–5 min and paste link here
+- **Demo video:** https://drive.google.com/file/d/1BNfLChMRZLs4D77LK-MooK56GZTs2dpP/view?usp=sharing
 
 ## Run the project
 
